@@ -11,8 +11,8 @@
 
 %% API
 -export([start_link/1,
-        stop/1,
-        handle_message/3]).
+         stop/1,
+         handle_message/3]).
 
 %% gen_server callbacks
 -export([init/1,
@@ -27,21 +27,19 @@
 -include_lib("of_protocol/include/ofp_v4.hrl").
 -include("xmpp_ofc_v4.hrl").
 
--type fwd_table() :: #{MacAddr :: string() => SwitchPort :: integer()}.
--record(state, {datapath_id :: binary(),
-                fwd_table :: fwd_table()}).
+-record(state, {datapath_id :: binary()}).
 
 -define(SERVER, ?MODULE).
 -define(OF_VER, 4).
 -define(FM_TIMEOUT_S(Type), case Type of
                                 idle ->
-                                    10;
+                                    20;
                                 hard ->
-                                    30
+                                    40
                             end).
 -define(FM_INITIAL_COOKIE, <<0, 0, 0, 0, 0, 0, 0, 150>>).
 -define(FLOW_STAT_REQUEST_INTERVAL, 5000).
--define(PACKETS_THRESHOLD, 50).
+-define(PACKETS_THRESHOLD, 10).
 %%%===================================================================
 %%% API
 %%%===================================================================
@@ -53,7 +51,7 @@ start_link(DatapathId) ->
     {ok, Pid, subscriptions(), [init_flow_mod()]}.
 
 -spec stop(pid()) -> ok.
-    stop(Pid) ->
+stop(Pid) ->
     gen_server:stop(Pid).
 
 -spec handle_message(pid(),
@@ -69,44 +67,30 @@ handle_message(Pid, Msg, OFMessages) ->
 %%%===================================================================
 
 init([DatapathId]) ->
-    {ok, #state{datapath_id = DatapathId, fwd_table = #{}}}.
+    {ok, #state{datapath_id = DatapathId}}.
 
-handle_call({handle_message, Msg = {packet_it, _, MsgBody}, CurrOFMessages},
-            _From, State = #state{datapath_id = Dpid, fwd_table = FwdTable0}) ->
+handle_call({handle_message, Msg = {packet_in, _, MsgBody}, CurrOFMessages},
+            _From, State = #state{datapath_id = Dpid}) ->
     case packet_in_extract([reason, cookie], MsgBody) of
         [action, ?FM_INITIAL_COOKIE] ->
-            {OFMessages, FwdTable1} = handle_packet_in(Msg, Dpid, FwdTable0),
-            {reply, OFMessages ++ CurrOFMessages,
-             State#state{fwd_table = FwdTable1}};
+            {OFMessages} = handle_packet_in(Msg, Dpid),
+            {reply, OFMessages ++ CurrOFMessages, State};
         _ ->
             {reply, CurrOFMessages, State}
     end;
 
-handle_call({handle_message, {flow_stats_reply, _, MsgBody}, CurrOFMessages},
-        _From, State = #state{datapath_id = DatapathId}) ->
-    [IpSrc, TCPSrc, PacketCount, DurationSec] =
-    flow_stats_extract([ipv4_src,
-                        tcp_src,
-                        packet_count,
-                        duration_sec], MsgBody),
-    case packets_threshold_exceeed(PacketCount, DurationSec) of
-        true ->
-            OFMsg = drop_flow_mod(IpSrc, TCPSrc),
-            {reply, CurrOFMessages ++ OFMsg, State};
-        false ->
-            schedule_flow_stats_request(DatapathId, IpSrc, TCPSrc),
+handle_call({handle_message, Msg = {flow_stats_reply, _, MsgBody}, CurrOFMessages},
+            _From, State = #state{datapath_id = DatapathId}) ->
+    case flow_stats_extract(cookie, MsgBody) of
+        <<0, 0, 0, 0, 0, 0, 0, 200>> ->
+            OFMsg = handle_flow_stats(Msg, DatapathId),
+            {reply, OFMsg ++ CurrOFMessages, State};
+        _ ->
             {reply, CurrOFMessages, State}
     end.
 
 handle_cast(_Request, State) ->
     {noreply, State}.
-
-handle_info({remove_entry, Dpid, SrcMac},
-            #state{fwd_table = FwdTable} = State) ->
-    lager:debug("Removed forwarding entry in ~p: ~p => ~p",
-                [Dpid, format_mac(SrcMac), maps:get(SrcMac,
-                                                    FwdTable)]),
-    {noreply, State#state{fwd_table = maps:remove(SrcMac, FwdTable)}};
 
 handle_info({send_flow_stats_request, DatapathId, TCPSrc, IpSrc}, State) ->
     Matches = [{eth_type, 16#0800},
@@ -145,7 +129,7 @@ init_flow_mod() ->
                 {cookie_mask, <<0, 0, 0, 0, 0, 0, 0, 0>>}],
     of_msg_lib:flow_add(?OF_VER, Matches, Instructions, FlowOpts).
 
-handle_packet_in({_, Xid, PacketIn}, Dpid, FwdTable0) ->
+handle_packet_in({_, Xid, PacketIn}, Dpid) ->
     [IpSrc, TCPSrc] = packet_in_extract([ipv4_src, tcp_src], PacketIn),
     Matches = [{eth_type, 16#0800},
                {ipv4_src, IpSrc},
@@ -153,7 +137,7 @@ handle_packet_in({_, Xid, PacketIn}, Dpid, FwdTable0) ->
                {tcp_src, TCPSrc},
                {tcp_dst, <<5222:16>>}],
     Instructions = [{apply_actions, [{output, 1, no_buffer}]}],
-    FlowOpts = [{table_id, 0}, {priority, 150},
+    FlowOpts = [{table_id, 0}, {priority, 200},
                 {idle_timeout, ?FM_TIMEOUT_S(idle)},
                 {hard_timeout, ?FM_TIMEOUT_S(hard)},
                 {cookie, <<0, 0, 0, 0, 0, 0, 0, 200>>},
@@ -161,21 +145,41 @@ handle_packet_in({_, Xid, PacketIn}, Dpid, FwdTable0) ->
     FM = of_msg_lib:flow_add(?OF_VER, Matches, Instructions, FlowOpts),
     PO = packet_out(Xid, PacketIn, 1),
     schedule_flow_stats_request(Dpid, IpSrc, TCPSrc),
-    {[FM, PO], FwdTable0}.
+    {[FM, PO]}.
 
 drop_flow_mod(IpSrc, TCPSrc) ->
+    lager:info("Initializing drop flow mod"),
     Matches = [{eth_type, 16#0800},
                {ipv4_src, IpSrc},
                {ip_proto, <<6>>},
                {tcp_src, TCPSrc},
                {tcp_dst, <<5222:16>>}],
     Instructions = [{apply_actions, []}],
-    FlowOpts = [{table_id, 0}, {priority, 150},
+    FlowOpts = [{table_id, 0}, {priority, 250},
                 {idle_timeout, ?FM_TIMEOUT_S(idle)},
                 {hard_timeout, ?FM_TIMEOUT_S(hard)},
-                {cookie, <<0,0,0,0,0,0,0,200>>},
-                {cookie_mask, <<0,0,0,0,0,0,0,0>>}],
-    of_msg_lib:flow_add(?OF_VER, Matches, Instructions, FlowOpts).
+                {cookie, <<0, 0, 0, 0, 0, 0, 0, 250>>},
+                {cookie_mask, <<0, 0, 0, 0, 0, 0, 0>>}],
+    [of_msg_lib:flow_add(?OF_VER, Matches, Instructions, FlowOpts)].
+
+handle_flow_stats({_, _, MsgBody}, DatapathId) ->
+    case flow_stats_extract(flows, MsgBody) of
+        [] ->
+            [];
+        _ ->
+            [IpSrc, TCPSrc, PacketCount, DurationSec] =
+            flow_stats_extract([ipv4_src,
+                                tcp_src,
+                                packet_count,
+                                duration_sec], MsgBody),
+            case packets_threshold_exceed(PacketCount, DurationSec) of
+                true ->
+                    drop_flow_mod(IpSrc, TCPSrc);
+                false ->
+                    schedule_flow_stats_request(DatapathId, IpSrc, TCPSrc),
+                    []
+            end
+    end.
 
 packet_out(Xid, PacketIn, OutPort) ->
     Actions = [{output, OutPort, no_buffer}],
@@ -204,6 +208,18 @@ packet_in_extract(dst_mac, PacketIn) ->
 packet_in_extract(in_port, PacketIn) ->
     <<InPort:32>> = proplists:get_value(in_port, proplists:get_value(match, PacketIn)),
     InPort;
+packet_in_extract(ipv4_src, PacketIn) ->
+    Data = packet_in_extract(data, PacketIn),
+    <<_:26/bytes, IpSrc:4/bytes, _/binary>> = Data,
+    IpSrc;
+packet_in_extract(tcp_src, PacketIn) ->
+    Data = packet_in_extract(data, PacketIn),
+    <<_:14/bytes, _:4, IHL:4, _:19/bytes, IpData/binary>> = Data,
+    OptionsLength = 4 * (IHL - 5),
+    <<_:OptionsLength/bytes, TcpSrc:2/bytes, _/binary>> = IpData,
+    TcpSrc;
+packet_in_extract(cookie, PacketIn) ->
+    proplists:get_value(cookie, PacketIn);
 packet_in_extract(buffer_id, PacketIn) ->
     proplists:get_value(buffer_id, PacketIn);
 packet_in_extract(data, PacketIn) ->
@@ -211,25 +227,33 @@ packet_in_extract(data, PacketIn) ->
 packet_in_extract(reason, PacketIn) ->
     proplists:get_value(reason, PacketIn).
 
+
 flow_stats_extract(Elements, FlowStats) when is_list(Elements) ->
     [flow_stats_extract(H, FlowStats) || H <- Elements];
 flow_stats_extract(ipv4_src, FlowStats) ->
-    proplists:get_value(ipv4_src, FlowStats);
+    proplists:get_value(ipv4_src, flow_stats_extract(match, FlowStats));
 flow_stats_extract(tcp_src, FlowStats) ->
-    proplists:get_value(tcp_src, FlowStats);
+    proplists:get_value(tcp_src, flow_stats_extract(match, FlowStats));
 flow_stats_extract(packet_count, FlowStats) ->
-    proplists:get_value(packet_count, FlowStats);
+    proplists:get_value(packet_count, flow_stats_extract(flows, FlowStats));
 flow_stats_extract(duration_sec, FlowStats) ->
-    proplists:get_value(duration_sec, FlowStats).
-
-format_mac(MacBin) ->
-    Mac0 = [":" ++ integer_to_list(X, 16) || <<X>> <= MacBin],
-    tl(lists:flatten(Mac0)).
+    proplists:get_value(duration_sec, flow_stats_extract(flows, FlowStats));
+flow_stats_extract(flows, FlowStats) ->
+    Flows = proplists:get_value(flows, FlowStats),
+    case Flows of
+        [] -> [];
+        List -> hd(List)
+    end;
+flow_stats_extract(match, FlowStats) ->
+    proplists:get_value(match, flow_stats_extract(flows, FlowStats));
+flow_stats_extract(cookie, FlowStats) ->
+    proplists:get_value(cookie, flow_stats_extract(flows, FlowStats)).
 
 schedule_flow_stats_request(DatapathId, IpSrc, TCPSrc) ->
     timer:send_after(?FLOW_STAT_REQUEST_INTERVAL,
                      {send_flow_stats_request,
                       DatapathId, TCPSrc, IpSrc}).
 
-packets_threshold_exceeed(PacketCount, DurationSec) ->
-    PacketCount/DurationSec/60 > ?PACKETS_THRESHOLD.
+packets_threshold_exceed(PacketCount, DurationSec) ->
+    PacketCount / (DurationSec / 60) > ?PACKETS_THRESHOLD.
+
